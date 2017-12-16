@@ -25,7 +25,7 @@ struct nonce_indexer_struct {
 	size_t nonce_idx; size_t nonce_len;
 	size_t idx; 
 	size_t thread_idx; 
-	const uint8_t *thread_nonces;
+	const uint8_t *thread_nonce;
 };
 
 __host__ __device__ bool increment(uint8_t *bytes, uint32_t bytes_len) {
@@ -66,7 +66,7 @@ __host__ __device__ uint8_t default_indexer_wrapper(void *arg) {
 	return default_indexer(data->in_b, data->len, data->idx);
 }
 
-__host__ __device__ uint8_t nonce_indexer(const uint8_t *block, size_t block_len, size_t nonce_idx, size_t nonce_len, size_t idx, size_t thread_idx, const uint8_t *thread_nonces) {
+__host__ __device__ uint8_t nonce_indexer(const uint8_t *block, size_t block_len, size_t nonce_idx, size_t nonce_len, size_t idx, size_t thread_idx, const uint8_t *thread_nonce) {
 
 	if (idx >= block_len)
 		return 0;
@@ -75,12 +75,12 @@ __host__ __device__ uint8_t nonce_indexer(const uint8_t *block, size_t block_len
 		return *(block + idx);
 	}
 
-	return *(thread_nonces + (idx - nonce_idx));
+	return *(thread_nonce + (idx - nonce_idx));
 }
 
 __host__ __device__ uint8_t nonce_indexer_wrapper(void *arg) {
 	nonce_indexer_struct *data = (nonce_indexer_struct*)arg;
-	return nonce_indexer(data->block, data->block_len, data->nonce_idx, data->nonce_len, data->idx, data->thread_idx, data->thread_nonces);
+	return nonce_indexer(data->block, data->block_len, data->nonce_idx, data->nonce_len, data->idx, data->thread_idx, data->thread_nonce);
 }
 
 __host__ __device__ void nonce_indexer_prepper(void *arg, size_t idx) {
@@ -131,16 +131,16 @@ __host__ __device__ void hash_256(const uint8_t *in_b, size_t in_b_len, uint8_t 
 
 			if (block_idx < in_b_len) {
 				for (size_t i = 0; i < block_size - overflow_len; ++i) {
-
+					uint8_t val = 0;
 					if (indexer_args == nullptr) {
-						*((uint8_t*)(&block) + i) = *(in_b + block_idx + i);
+						val = *(in_b + block_idx + i);
 					}
 					else {
 						indexer_paramter_setter(indexer_args, block_idx + i);
-						*((uint8_t*)(&block) + i) = indexer(indexer_args);
+						val = indexer(indexer_args);
 					}
+					*((uint8_t*)(&block) + i) = val;
 				}
-				//std::memcpy(&block, in_b + block_idx, block_size - overflow_len);
 			}
 
 			uint32_t ta = (((ROL(a, 3) & ~ROR(e, 7)) ^ (~ROL(d, 5) & ROR(e, 7))) ^ ROR(block, 3));
@@ -250,7 +250,7 @@ __global__ void kernel_hash(
 	indexer_data.nonce_idx = nonce_idx;
 	indexer_data.nonce_len = nonce_len;
 	indexer_data.thread_idx = thread_idx;
-	indexer_data.thread_nonces = thread_nonces;
+	indexer_data.thread_nonce = thread_nonces + thread_nonces_idx;
 
 	// set the hash
 	for (size_t i = 0; i < hash_len; ++i) {
@@ -290,13 +290,13 @@ uint8_t* build_random_char_sequence(uint32_t len) {
 int main() {
 	// host data
 	const size_t step_count = 100;
-	const uint32_t block_count = 4;
-	const uint32_t threads_per_block = 500;
+	const uint32_t block_count = 2;
+	const uint32_t threads_per_block = 300;
 	const uint32_t thread_count = block_count * threads_per_block;
 	const uint32_t block_len = 26;
 	const uint32_t nonce_idx = 5;
 	const uint32_t nonce_len = 10;
-	const uint32_t diff = 10;
+	const uint32_t diff = 8;
 	const uint8_t hash_len = 32;
 
 	bool *nonce_res;
