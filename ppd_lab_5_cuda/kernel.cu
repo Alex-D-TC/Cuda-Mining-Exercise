@@ -6,11 +6,27 @@
 #include <string>
 #include <iostream>
 #include <time.h>
+#include <functional>
 
 #define ROR(bytes, cnt) ( (bytes >> cnt) | ( bytes << ((sizeof(bytes) * 8) - cnt) ) )
 #define ROL(bytes, cnt) ( (bytes << cnt) | ( bytes >> ((sizeof(bytes) * 8) - cnt) ) )
 #define CUDA_HANDLE_ERR(err, desc_str) if(err != cudaSuccess) printf("%s: %s\n", desc_str, cudaGetErrorString(err));
 #define CUDA_HANDLE_ERR_BOOL_FLAG(err, desc_str, flag) if(err != cudaSuccess) { printf("%s: %s\n", desc_str, cudaGetErrorString(err)); flag = true; }
+
+struct default_indexer_struct {
+	const uint8_t *in_b;
+	size_t len;
+	size_t idx;
+};
+
+struct nonce_indexer_struct {
+	const uint8_t *block;
+	size_t block_len;
+	size_t nonce_idx; size_t nonce_len;
+	size_t idx; 
+	size_t thread_idx; 
+	const uint8_t *thread_nonces;
+};
 
 __host__ __device__ bool increment(uint8_t *bytes, uint32_t bytes_len) {
 	bool overflow = true;
@@ -39,7 +55,47 @@ __host__ __device__ uint32_t zero_count(uint8_t *in_b, size_t in_b_len) {
 	return count;
 }
 
-__host__ __device__ void hash_256(const uint8_t *in_b, size_t in_b_len, uint8_t *out_b) {
+__host__ __device__ uint8_t default_indexer(const uint8_t *in_b, size_t len, size_t idx) {
+	if (idx >= len)
+		return 0;
+	return *(in_b + idx);
+}
+
+__host__ __device__ uint8_t default_indexer_wrapper(void *arg) {
+	default_indexer_struct *data = (default_indexer_struct*)arg;
+	return default_indexer(data->in_b, data->len, data->idx);
+}
+
+__host__ __device__ uint8_t nonce_indexer(const uint8_t *block, size_t block_len, size_t nonce_idx, size_t nonce_len, size_t idx, size_t thread_idx, const uint8_t *thread_nonces) {
+
+	if (idx >= block_len)
+		return 0;
+
+	if (idx < nonce_idx || idx >= nonce_idx + nonce_len) {
+		return *(block + idx);
+	}
+
+	return *(thread_nonces + (idx - nonce_idx));
+}
+
+__host__ __device__ uint8_t nonce_indexer_wrapper(void *arg) {
+	nonce_indexer_struct *data = (nonce_indexer_struct*)arg;
+	return nonce_indexer(data->block, data->block_len, data->nonce_idx, data->nonce_len, data->idx, data->thread_idx, data->thread_nonces);
+}
+
+__host__ __device__ void nonce_indexer_prepper(void *arg, size_t idx) {
+	((nonce_indexer_struct*)(arg))->idx = idx;
+}
+
+__host__ uint8_t do_nothing(void* arg) {
+	return 0;
+}
+
+__host__ void do_nothing(void* args, size_t idx) {
+	// :>
+}
+
+__host__ __device__ void hash_256(const uint8_t *in_b, size_t in_b_len, uint8_t *out_b, void* indexer_args = nullptr, uint8_t (*indexer)(void*) = do_nothing, void (*indexer_paramter_setter)(void*, size_t) = do_nothing) {
 	uint32_t a = 0x6a09e667, b = 0xbb67ae85, c = 0x3c6ef372, d = 0xa54ff53a,
 		e = 0x510e527f, f = 0x9b05688c, g = 0x1f83d9ab, h = 0x5be0cd19;
 
@@ -74,10 +130,17 @@ __host__ __device__ void hash_256(const uint8_t *in_b, size_t in_b_len, uint8_t 
 				overflow_len = 4;
 
 			if (block_idx < in_b_len) {
-				/*for (size_t i = 0; i < block_size - overflow_len; ++i) {
-					*((uint8_t*)(&block) + i) = *(in_b + block_idx + i);
-				}*/
-				std::memcpy(&block, in_b + block_idx, block_size - overflow_len);
+				for (size_t i = 0; i < block_size - overflow_len; ++i) {
+
+					if (indexer_args == nullptr) {
+						*((uint8_t*)(&block) + i) = *(in_b + block_idx + i);
+					}
+					else {
+						indexer_paramter_setter(indexer_args, block_idx + i);
+						*((uint8_t*)(&block) + i) = indexer(indexer_args);
+					}
+				}
+				//std::memcpy(&block, in_b + block_idx, block_size - overflow_len);
 			}
 
 			uint32_t ta = (((ROL(a, 3) & ~ROR(e, 7)) ^ (~ROL(d, 5) & ROR(e, 7))) ^ ROR(block, 3));
@@ -151,15 +214,14 @@ __device__ void print_arr(const uint8_t * arr, size_t arr_len, size_t line_len) 
 }
 
 __global__ void kernel_hash(
-	uint8_t *blocks,
-	size_t blocks_pitch,
+	uint8_t *block,
 	uint32_t block_len,
 	uint32_t nonce_idx,
 	uint32_t nonce_len,
 	bool *nonce_res,
 	bool *done,
-	uint8_t *thread_counters,
-	size_t thread_counters_pitch,
+	uint8_t *thread_nonces,
+	size_t thread_nonces_pitch,
 	uint8_t *thread_hashes,
 	size_t thread_hashes_pitch,
 	size_t hash_len,
@@ -175,17 +237,20 @@ __global__ void kernel_hash(
 	size_t globalThreadNum = blockNumInGrid * threadsPerBlock + threadNumInBlock;
 
 	size_t thread_idx = globalThreadNum;
-	size_t block_idx = thread_idx * (block_len + blocks_pitch);
-	size_t thread_counter_idx = thread_idx * (thread_counters_pitch + nonce_len);
+	size_t thread_nonces_idx = thread_idx * (thread_nonces_pitch + nonce_len);
 	size_t thread_hashes_idx = thread_idx * (thread_hashes_pitch + hash_len);
 	bool overflow = false;
 
 	*done = false;
 
-	// clear the counter
-	for (size_t i = 0; i < nonce_len; ++i) {
-		thread_counters[thread_counter_idx + i] = 0;
-	}
+	// prep indexer
+	nonce_indexer_struct indexer_data;
+	indexer_data.block = block;
+	indexer_data.block_len = block_len;
+	indexer_data.nonce_idx = nonce_idx;
+	indexer_data.nonce_len = nonce_len;
+	indexer_data.thread_idx = thread_idx;
+	indexer_data.thread_nonces = thread_nonces;
 
 	// set the hash
 	for (size_t i = 0; i < hash_len; ++i) {
@@ -194,7 +259,7 @@ __global__ void kernel_hash(
 
 	while (!overflow && !(*done)) {
 
-		hash_256(blocks + block_idx, block_len, thread_hashes + thread_hashes_idx);
+		hash_256(block, block_len, thread_hashes + thread_hashes_idx, (void*)(&indexer_data), nonce_indexer_wrapper, nonce_indexer_prepper);
 		//printf("%llu\n", size_t(blocks));
 		//__syncthreads();
 
@@ -206,13 +271,7 @@ __global__ void kernel_hash(
 		else {
 			// increment nonce
 			for (size_t i = 0; !overflow && i < thread_count; ++i)
-				overflow = increment(blocks + block_idx + nonce_idx, nonce_len);
-			if (overflow) {
-				*done = true;
-			}
-
-			// increment counter
-			overflow = increment(thread_counters + thread_counter_idx, nonce_len);
+				overflow = increment(thread_nonces + thread_nonces_idx, nonce_len);
 			if (overflow) {
 				*done = true;
 			}
@@ -228,45 +287,32 @@ uint8_t* build_random_char_sequence(uint32_t len) {
 	return data;
 }
 
-void test_hash_256(size_t run_cnt) {
-
-	uint8_t hash[32]{ 0 };
-	uint8_t *bytes = build_random_char_sequence(15);
-	std::memset(bytes + 3, 0, 5);
-	
-	while (run_cnt--) {
-		hash_256(bytes, 15, hash);
-		increment(bytes + 3, 5);
-	}
-}
-
 int main() {
 	// host data
 	const size_t step_count = 100;
-	const uint32_t block_count = 1;
+	const uint32_t block_count = 4;
 	const uint32_t threads_per_block = 500;
 	const uint32_t thread_count = block_count * threads_per_block;
 	const uint32_t block_len = 26;
 	const uint32_t nonce_idx = 5;
 	const uint32_t nonce_len = 10;
-	const uint32_t diff = 16;
+	const uint32_t diff = 10;
 	const uint8_t hash_len = 32;
 
 	bool *nonce_res;
-	uint8_t *blocks;
 	int64_t correct_idx = -1;
 	uint8_t counter[nonce_len];
-	uint8_t *block = build_random_char_sequence(block_len);
+	uint8_t *block;
 
 	// result nonce
 	uint8_t nonce[nonce_len]{ 0 };
-	uint8_t *counters;
+	uint8_t *nonces;
 
 	// device data
-	uint8_t *d_blocks;
+	uint8_t *d_block;
 	bool *d_nonce_res;
 	bool *d_done;
-	uint8_t *d_thread_counters;
+	uint8_t *d_thread_nonces;
 	uint8_t *d_thread_hashes;
 
 	// alloc space
@@ -275,15 +321,15 @@ int main() {
 		nonce_res[i] = false;
 
 	CUDA_HANDLE_ERR(cudaMalloc(&d_nonce_res, thread_count * sizeof(bool)), "Error on malloc for d_nonce_res");
-	
-	blocks = new uint8_t[block_len * thread_count];
-	CUDA_HANDLE_ERR(cudaMalloc(&d_blocks, thread_count * block_len), "Error on malloc for d_blocks");
-	
+
+	block = build_random_char_sequence(block_len);
+	CUDA_HANDLE_ERR(cudaMalloc(&d_block, block_len), "Error on malloc for d_blocks");
+
 	CUDA_HANDLE_ERR(cudaMalloc(&d_done, sizeof(bool)), "Error on malloc for d_done");
-	
-	counters = new uint8_t[thread_count * nonce_len];
-	CUDA_HANDLE_ERR(cudaMalloc(&d_thread_counters, thread_count * nonce_len), "Error on malloc for d_thread_counters");
-	
+
+	nonces = new uint8_t[thread_count * nonce_len];
+	CUDA_HANDLE_ERR(cudaMalloc(&d_thread_nonces, thread_count * nonce_len), "Error on malloc for d_thread_counters");
+
 	CUDA_HANDLE_ERR(cudaMalloc(&d_thread_hashes, thread_count * hash_len), "Error on malloc for d_thread_hashes");
 
 	for (size_t i = 0; i < thread_count; ++i)
@@ -294,31 +340,31 @@ int main() {
 	for (size_t i = 0; i < thread_count; ++i) {
 		if (i)
 			increment(counter, nonce_len);
-	
-		std::memcpy(blocks + (i * block_len), block, block_len);
-		std::memcpy(blocks + (i * block_len) + nonce_idx, counter, nonce_len);
+
+		std::memcpy(nonces + (i * nonce_len), counter, nonce_len);
 	}
 
-	CUDA_HANDLE_ERR(cudaMemcpy(d_blocks, blocks, thread_count * block_len, cudaMemcpyHostToDevice), "Error on memcpy for blocks to d_blocks");
+	CUDA_HANDLE_ERR(cudaMemcpy(d_block, block, block_len, cudaMemcpyHostToDevice), "Error on memcpy for block to d_block");
 	CUDA_HANDLE_ERR(cudaMemcpy(d_nonce_res, nonce_res, thread_count * sizeof(bool), cudaMemcpyHostToDevice), "Error on memcpy for nonce_res to d_nonce_res");
 
 	bool error_occured = false;
 
 	do {
 		kernel_hash<<<block_count, threads_per_block>>>(
-			d_blocks, 0, block_len, nonce_idx, nonce_len, 
+			d_block, block_len, nonce_idx, nonce_len, 
 			d_nonce_res, 
 			d_done, 
-			d_thread_counters, 0, 
+			d_thread_nonces, 0, 
 			d_thread_hashes, 0, hash_len, 
-			thread_count, diff,
+			thread_count, 
+			diff, 
 			step_count);
 
 		CUDA_HANDLE_ERR_BOOL_FLAG(cudaGetLastError(), "Sync kernel error", error_occured);
 		CUDA_HANDLE_ERR_BOOL_FLAG(cudaDeviceSynchronize(), "Async kernel error", error_occured);
 		CUDA_HANDLE_ERR_BOOL_FLAG(cudaMemcpy(nonce_res, d_nonce_res, thread_count * sizeof(bool), cudaMemcpyDeviceToHost), "Error on getting nonce_res for data", error_occured);
-		CUDA_HANDLE_ERR_BOOL_FLAG(cudaMemcpy(counters, d_thread_counters, thread_count * nonce_len, cudaMemcpyDeviceToHost), "Error on getting counters from device", error_occured);
-		
+		CUDA_HANDLE_ERR_BOOL_FLAG(cudaMemcpy(nonces, d_thread_nonces, thread_count * nonce_len, cudaMemcpyDeviceToHost), "Error on getting counters from device", error_occured);
+
 		for (uint32_t i = 0; correct_idx == -1 && i < thread_count; ++i)
 			if (nonce_res[i])
 				correct_idx = i;
@@ -328,16 +374,11 @@ int main() {
 	if (correct_idx == -1)
 		goto cleanup;
 
-	// do something with the nonce
+	// get the nonce of the winning thread
 	std::cout << correct_idx << "\n";
-	for (uint8_t step_counter[nonce_len]{ 0 }; memcmp(step_counter, counters + correct_idx * nonce_len, nonce_len) != 0; increment(step_counter, nonce_len)) {
-		for (size_t i = 0; i < thread_count; ++i)
-			increment(nonce, nonce_len);
+	for (size_t i = 0; i < nonce_len; ++i) {
+		nonce[i] = nonces[correct_idx * nonce_len + i];
 	}
-
-	// find the starting nonce of the 'winning' thread
-	while (correct_idx--)
-		increment(nonce, nonce_len);
 
 	// print the nonce
 	for (size_t i = 0; i < nonce_len; ++i)
@@ -358,14 +399,13 @@ int main() {
 cleanup:
 
 	cudaFree(d_nonce_res);
-	cudaFree(d_blocks);
+	cudaFree(d_block);
 	cudaFree(d_done);
-	cudaFree(d_thread_counters);
+	cudaFree(d_thread_nonces);
 	cudaFree(d_thread_hashes);
 
-	delete[] counters;
+	delete[] nonces;
 	delete[] nonce_res;
-	delete[] blocks;
 	delete[] block;
 	return 0;
 }
